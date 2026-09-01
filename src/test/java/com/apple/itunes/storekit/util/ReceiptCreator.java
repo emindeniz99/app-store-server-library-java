@@ -105,6 +105,21 @@ public class ReceiptCreator {
         return new ReceiptCreator(List.of(certificate), keyPair.getPrivate());
     }
 
+    /**
+     * A chain whose leaf holds an EC key instead of the RSA key the App Store
+     * signs receipts with; the chain itself is unchanged, so only the signer
+     * key check stands between such a receipt and acceptance.
+     */
+    public static ReceiptCreator createReceiptCreatorWithNonRsaLeaf() throws Exception {
+        KeyPair rootKeyPair = rsaKeyPair();
+        KeyPair intermediateKeyPair = rsaKeyPair();
+        KeyPair leafKeyPair = ecKeyPair();
+        X509Certificate root = certificate("CN=Test App Store Root CA", rootKeyPair.getPublic(), "CN=Test App Store Root CA", rootKeyPair.getPrivate(), true, null, tenYearsAgo(), inOneYear());
+        X509Certificate intermediate = certificate("CN=Test WWDR CA", intermediateKeyPair.getPublic(), "CN=Test App Store Root CA", rootKeyPair.getPrivate(), true, WWDR_INTERMEDIATE_OID, tenYearsAgo(), inOneYear());
+        X509Certificate leaf = certificate("CN=Test Receipt Signing", leafKeyPair.getPublic(), "CN=Test WWDR CA", intermediateKeyPair.getPrivate(), false, RECEIPT_SIGNER_OID, tenYearsAgo(), inOneYear());
+        return new ReceiptCreator(List.of(leaf, intermediate, root), leafKeyPair.getPrivate());
+    }
+
     /** The root of this chain, in the form the verifier's constructor accepts. */
     public InputStream getRootCertificate() throws CertificateEncodingException {
         return new ByteArrayInputStream(chain.get(chain.size() - 1).getEncoded());
@@ -159,18 +174,34 @@ public class ReceiptCreator {
         return signReceipt(payload, chain.subList(1, chain.size()), new Date(), SIGNATURE_ALGORITHM);
     }
 
+    /**
+     * A receipt whose signature covers the payload directly rather than a set of
+     * signed attributes — the shape a receipt issued by the App Store takes.
+     */
+    public byte[] signReceiptWithoutSignedAttributes(byte[] payload) throws Exception {
+        return signReceipt(payload, chain, new Date(), SIGNATURE_ALGORITHM, false);
+    }
+
     private byte[] signReceipt(byte[] payload, int embeddedCertificates, Date signingTime) throws Exception {
-        return signReceipt(payload, chain.subList(0, embeddedCertificates), signingTime, SIGNATURE_ALGORITHM);
+        return signReceipt(payload, chain.subList(0, embeddedCertificates), signingTime, SIGNATURE_ALGORITHM, true);
     }
 
     private byte[] signReceipt(byte[] payload, List<X509Certificate> embedded, Date signingTime, String signatureAlgorithm) throws Exception {
-        ASN1EncodableVector signedAttributes = new ASN1EncodableVector();
-        signedAttributes.add(new Attribute(CMSAttributes.signingTime, new DERSet(new Time(signingTime))));
+        return signReceipt(payload, embedded, signingTime, signatureAlgorithm, true);
+    }
+
+    private byte[] signReceipt(byte[] payload, List<X509Certificate> embedded, Date signingTime, String signatureAlgorithm, boolean signedAttributes) throws Exception {
         CMSSignedDataGenerator generator = new CMSSignedDataGenerator();
         ContentSigner contentSigner = new JcaContentSignerBuilder(signatureAlgorithm).build(signingKey);
-        generator.addSignerInfoGenerator(new JcaSignerInfoGeneratorBuilder(new JcaDigestCalculatorProviderBuilder().setProvider(BOUNCY_CASTLE_PROVIDER).build())
-                .setSignedAttributeGenerator(new DefaultSignedAttributeTableGenerator(new AttributeTable(signedAttributes)))
-                .build(contentSigner, chain.get(0)));
+        JcaSignerInfoGeneratorBuilder signerInfoGeneratorBuilder = new JcaSignerInfoGeneratorBuilder(new JcaDigestCalculatorProviderBuilder().setProvider(BOUNCY_CASTLE_PROVIDER).build());
+        if (signedAttributes) {
+            ASN1EncodableVector attributes = new ASN1EncodableVector();
+            attributes.add(new Attribute(CMSAttributes.signingTime, new DERSet(new Time(signingTime))));
+            signerInfoGeneratorBuilder.setSignedAttributeGenerator(new DefaultSignedAttributeTableGenerator(new AttributeTable(attributes)));
+        } else {
+            signerInfoGeneratorBuilder.setDirectSignature(true);
+        }
+        generator.addSignerInfoGenerator(signerInfoGeneratorBuilder.build(contentSigner, chain.get(0)));
         generator.addCertificates(new JcaCertStore(embedded));
         return generator.generate(new CMSProcessableByteArray(payload), true).getEncoded();
     }
@@ -210,8 +241,12 @@ public class ReceiptCreator {
             return raw(type, new ASN1Integer(value).getEncoded());
         }
 
-        /** An attribute whose value bytes are used as-is, e.g. an opaque value or a nested SET. */
-        public AttributeSet raw(int type, byte[] value) {
+        /**
+         * An attribute whose value bytes are used as-is, e.g. an opaque value or
+         * a nested SET. The type is a long so that a receipt carrying a type
+         * outside the int range can be built.
+         */
+        public AttributeSet raw(long type, byte[] value) {
             attributes.add(new DERSequence(new ASN1Encodable[]{new ASN1Integer(type), new ASN1Integer(1), new DEROctetString(value)}));
             return this;
         }
@@ -232,6 +267,12 @@ public class ReceiptCreator {
     private static KeyPair rsaKeyPair() throws Exception {
         KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
         keyPairGenerator.initialize(2048);
+        return keyPairGenerator.generateKeyPair();
+    }
+
+    private static KeyPair ecKeyPair() throws Exception {
+        KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("EC");
+        keyPairGenerator.initialize(256);
         return keyPairGenerator.generateKeyPair();
     }
 

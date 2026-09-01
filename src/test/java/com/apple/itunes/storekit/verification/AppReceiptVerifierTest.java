@@ -6,11 +6,13 @@ import com.apple.itunes.storekit.model.AppReceipt;
 import com.apple.itunes.storekit.model.Environment;
 import com.apple.itunes.storekit.model.InAppPurchaseReceipt;
 import com.apple.itunes.storekit.util.ReceiptCreator;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.CertPathValidatorException;
 import java.time.Instant;
@@ -157,6 +159,67 @@ public class AppReceiptVerifierTest {
         AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
         VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(unknownTypeReceipt)));
         Assertions.assertEquals(VerificationStatus.INVALID_ENVIRONMENT, exception.getStatus());
+
+        AppReceiptVerifier productionVerifier = getReceiptVerifier(receiptCreator, Environment.PRODUCTION, BUNDLE_ID, false);
+        VerificationException productionException = Assertions.assertThrows(VerificationException.class, () -> productionVerifier.verifyAndDecodeAppReceipt(encode(unknownTypeReceipt)));
+        Assertions.assertEquals(VerificationStatus.INVALID_ENVIRONMENT, productionException.getStatus());
+    }
+
+    /**
+     * The receipt type is the only thing that tells a production receipt from a
+     * sandbox one, so each value the App Store issues must be accepted by a
+     * verifier for its own environment and by no other.
+     */
+    @Test
+    public void testReceiptTypeToEnvironmentMapping() throws Exception {
+        assertReceiptTypeBelongsTo("Production", Environment.PRODUCTION);
+        assertReceiptTypeBelongsTo("ProductionVPP", Environment.PRODUCTION);
+        assertReceiptTypeBelongsTo("ProductionSandbox", Environment.SANDBOX);
+        assertReceiptTypeBelongsTo("ProductionVPPSandbox", Environment.SANDBOX);
+    }
+
+    /**
+     * A receipt that names no type belongs to no environment, rather than
+     * failing on the missing value or passing for the environment asked for.
+     */
+    @Test
+    public void testReceiptWithoutAReceiptType() throws Exception {
+        byte[] receipt = receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+                .string(2, BUNDLE_ID)
+                .date(12, RECEIPT_CREATION_DATE)
+                .build());
+
+        AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.PRODUCTION, BUNDLE_ID, false);
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(receipt)));
+        Assertions.assertEquals(VerificationStatus.INVALID_ENVIRONMENT, exception.getStatus());
+    }
+
+    /** A receipt that names no app matches no app, for the same reason. */
+    @Test
+    public void testReceiptWithoutABundleId() throws Exception {
+        byte[] receipt = receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+                .string(0, "ProductionSandbox")
+                .date(12, RECEIPT_CREATION_DATE)
+                .build());
+
+        AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(receipt)));
+        Assertions.assertEquals(VerificationStatus.INVALID_APP_IDENTIFIER, exception.getStatus());
+    }
+
+    /**
+     * The creation date is what the chain is evaluated at, so a receipt that
+     * carries none falls back to the current date rather than failing on it.
+     */
+    @Test
+    public void testReceiptWithoutACreationDate() throws Exception {
+        byte[] receipt = receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+                .string(0, "ProductionSandbox")
+                .string(2, BUNDLE_ID)
+                .build());
+
+        AppReceipt decoded = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndDecodeAppReceipt(encode(receipt));
+        Assertions.assertNull(decoded.getReceiptCreationDate());
     }
 
     @Test
@@ -216,6 +279,18 @@ public class AppReceiptVerifierTest {
         Assertions.assertEquals(VerificationStatus.VERIFICATION_FAILURE, exception.getStatus());
     }
 
+    /**
+     * Base64 receipts pick up line breaks in transit, so decoding tolerates them
+     * rather than rejecting a receipt that is otherwise sound.
+     */
+    @Test
+    public void testReceiptWithLineBreaksInItsBase64() throws Exception {
+        String wrappedReceipt = Base64.getMimeEncoder().encodeToString(sandboxReceipt);
+
+        AppReceipt decoded = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndDecodeAppReceipt(wrappedReceipt);
+        Assertions.assertEquals(BUNDLE_ID, decoded.getBundleId());
+    }
+
     @Test
     public void testReceiptThatIsNotAPkcs7Container() throws Exception {
         AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
@@ -264,6 +339,20 @@ public class AppReceiptVerifierTest {
 
         AppReceiptVerifier verifier = getReceiptVerifier(expiredCreator, Environment.SANDBOX, BUNDLE_ID, true);
         VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(receipt)));
+        Assertions.assertEquals(VerificationStatus.INVALID_CHAIN, exception.getStatus());
+    }
+
+    /**
+     * Online checks are a request for revocation checking, not only for a
+     * different evaluation date, so a chain that publishes no revocation
+     * information stops verifying once they are on.
+     */
+    @Test
+    public void testChainWithoutRevocationInformationWithOnlineChecks() throws Exception {
+        Assertions.assertEquals(BUNDLE_ID, getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndDecodeAppReceipt(encode(sandboxReceipt)).getBundleId());
+
+        AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, true);
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(sandboxReceipt)));
         Assertions.assertEquals(VerificationStatus.INVALID_CHAIN, exception.getStatus());
     }
 
@@ -335,6 +424,66 @@ public class AppReceiptVerifierTest {
     }
 
     /**
+     * The bound is on how many certificates a receipt may carry, not on how many
+     * the chain needs, so a receipt at the bound is still verified and only one
+     * past it is rejected.
+     */
+    @Test
+    public void testReceiptAtAndPastTheEmbeddedCertificateBound() throws Exception {
+        byte[] receiptAtTheBound = receiptCreator.signReceiptWithPadding(receiptPayload("ProductionSandbox", BUNDLE_ID, RECEIPT_CREATION_DATE), 7);
+        byte[] receiptPastTheBound = receiptCreator.signReceiptWithPadding(receiptPayload("ProductionSandbox", BUNDLE_ID, RECEIPT_CREATION_DATE), 8);
+        AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
+
+        Assertions.assertEquals(BUNDLE_ID, verifier.verifyAndDecodeAppReceipt(encode(receiptAtTheBound)).getBundleId());
+
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(receiptPastTheBound)));
+        Assertions.assertEquals(VerificationStatus.INVALID_CHAIN_LENGTH, exception.getStatus());
+    }
+
+    /**
+     * A receipt the App Store issues carries no signed attributes, so its
+     * signature covers the payload directly. That is also the only shape in
+     * which a bad signature is reported to the verifier rather than raised by
+     * the CMS layer, so it is the shape that exercises the check itself.
+     */
+    @Test
+    public void testReceiptSignedWithoutSignedAttributes() throws Exception {
+        byte[] receipt = receiptCreator.signReceiptWithoutSignedAttributes(receiptPayload("ProductionSandbox", BUNDLE_ID, RECEIPT_CREATION_DATE));
+        AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
+
+        Assertions.assertEquals(BUNDLE_ID, verifier.verifyAndDecodeAppReceipt(encode(receipt)).getBundleId());
+
+        byte[] tamperedReceipt = receipt.clone();
+        tamperedReceipt[indexOf(tamperedReceipt, APP_VERSION.getBytes(StandardCharsets.UTF_8))] ^= 0x01;
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(tamperedReceipt)));
+        Assertions.assertEquals(VerificationStatus.VERIFICATION_FAILURE, exception.getStatus());
+    }
+
+    /** Apple signs app receipts with SHA-1, so it stays in the digest allowlist. */
+    @Test
+    public void testReceiptSignedWithSha1() throws Exception {
+        byte[] receipt = receiptCreator.signReceipt(receiptPayload("ProductionSandbox", BUNDLE_ID, RECEIPT_CREATION_DATE), "SHA1withRSA");
+
+        AppReceipt decoded = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndDecodeAppReceipt(encode(receipt));
+        Assertions.assertEquals(BUNDLE_ID, decoded.getBundleId());
+    }
+
+    /**
+     * A chain can validate while the key that signed the receipt is not the kind
+     * of key the App Store signs with, so the signer key is checked rather than
+     * taken on trust from the chain.
+     */
+    @Test
+    public void testReceiptSignedByANonRsaKey() throws Exception {
+        ReceiptCreator nonRsaCreator = ReceiptCreator.createReceiptCreatorWithNonRsaLeaf();
+        byte[] receipt = nonRsaCreator.signReceipt(receiptPayload("ProductionSandbox", BUNDLE_ID, RECEIPT_CREATION_DATE), "SHA256withECDSA");
+
+        AppReceiptVerifier verifier = getReceiptVerifier(nonRsaCreator, Environment.SANDBOX, BUNDLE_ID, false);
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(receipt)));
+        Assertions.assertEquals(VerificationStatus.VERIFICATION_FAILURE, exception.getStatus());
+    }
+
+    /**
      * A correctly signed receipt still fails when the signer names a digest
      * outside the allowlist, so the accepted algorithms never widen to whatever
      * a signer proposes.
@@ -360,6 +509,49 @@ public class AppReceiptVerifierTest {
         AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
         VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(receipt)));
         Assertions.assertEquals(VerificationStatus.VERIFICATION_FAILURE, exception.getStatus());
+    }
+
+    /**
+     * An attribute type past the int range must not alias a modelled type: a
+     * receipt could otherwise carry a second bundle id that the identity check
+     * reads in place of the one the payload declares.
+     */
+    @Test
+    public void testAttributeTypeOutsideTheIntegerRangeDoesNotAliasAModelledType() throws Exception {
+        long aliasingType = (1L << 32) + 2; // Truncates to the bundle id attribute type
+        byte[] otherBundleId = new DERUTF8String("com.example.other").getEncoded();
+        byte[] receipt = receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+                .string(0, "ProductionSandbox")
+                .string(2, BUNDLE_ID)
+                .date(12, RECEIPT_CREATION_DATE)
+                .raw(aliasingType, otherBundleId)
+                .build());
+
+        AppReceipt decoded = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndDecodeAppReceipt(encode(receipt));
+        Assertions.assertEquals(BUNDLE_ID, decoded.getBundleId());
+        Assertions.assertArrayEquals(otherBundleId, decoded.getUnknownAttributes().get(-1).get(0));
+    }
+
+    /**
+     * A receipt integer no long can hold is rejected rather than truncated into
+     * one, so a quantity or line item id can never arrive as an unrelated — or
+     * negative — number.
+     */
+    @Test
+    public void testInAppPurchaseIntegersOutsideTheRepresentableRange() throws Exception {
+        AppReceiptVerifier verifier = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false);
+
+        byte[] negativeQuantityReceipt = receiptCreator.signReceipt(receiptWithQuantity(BigInteger.valueOf(-1)));
+        VerificationException negativeException = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(negativeQuantityReceipt)));
+        Assertions.assertEquals(VerificationStatus.VERIFICATION_FAILURE, negativeException.getStatus());
+
+        byte[] oversizedQuantityReceipt = receiptCreator.signReceipt(receiptWithQuantity(BigInteger.ONE.shiftLeft(63)));
+        VerificationException oversizedException = Assertions.assertThrows(VerificationException.class, () -> verifier.verifyAndDecodeAppReceipt(encode(oversizedQuantityReceipt)));
+        Assertions.assertEquals(VerificationStatus.VERIFICATION_FAILURE, oversizedException.getStatus());
+
+        byte[] largestQuantityReceipt = receiptCreator.signReceipt(receiptWithQuantity(BigInteger.valueOf(Long.MAX_VALUE)));
+        AppReceipt decoded = verifier.verifyAndDecodeAppReceipt(encode(largestQuantityReceipt));
+        Assertions.assertEquals(Long.MAX_VALUE, decoded.getInAppPurchases().get(0).getQuantity());
     }
 
     /** As with an Xcode receipt, LocalTesting data is not signed by the App Store. */
@@ -401,6 +593,27 @@ public class AppReceiptVerifierTest {
         Assertions.assertNull(getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndExtractTransactionId(encode(receipt)));
     }
 
+    /**
+     * A purchase can carry only an original transaction id, so extraction falls
+     * back to it rather than reporting a receipt that does have in-app purchases
+     * as having none.
+     */
+    @Test
+    public void testVerifyAndExtractTransactionIdFallsBackToTheOriginalTransactionId() throws Exception {
+        byte[] receipt = receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+                .string(0, "ProductionSandbox")
+                .string(2, BUNDLE_ID)
+                .date(12, RECEIPT_CREATION_DATE)
+                .raw(17, ReceiptCreator.attributeSet()
+                        .string(1702, CONSUMABLE_PRODUCT_ID)
+                        .string(1705, "70000000000003")
+                        .build())
+                .build());
+
+        String transactionId = getReceiptVerifier(receiptCreator, Environment.SANDBOX, BUNDLE_ID, false).verifyAndExtractTransactionId(encode(receipt));
+        Assertions.assertEquals("70000000000003", transactionId);
+    }
+
     /** Unlike ReceiptUtility, extraction refuses a receipt that does not verify. */
     @Test
     public void testVerifyAndExtractTransactionIdRejectsForeignReceipt() throws Exception {
@@ -430,6 +643,30 @@ public class AppReceiptVerifierTest {
                 .raw(9999, UNKNOWN_RECEIPT_ATTRIBUTE_VALUE)
                 .raw(17, consumablePurchase())
                 .raw(17, subscriptionPurchase())
+                .build();
+    }
+
+    private static void assertReceiptTypeBelongsTo(String receiptType, Environment environment) throws Exception {
+        byte[] receipt = receiptCreator.signReceipt(receiptPayload(receiptType, BUNDLE_ID, RECEIPT_CREATION_DATE));
+        Environment otherEnvironment = Environment.PRODUCTION.equals(environment) ? Environment.SANDBOX : Environment.PRODUCTION;
+
+        AppReceipt decoded = getReceiptVerifier(receiptCreator, environment, BUNDLE_ID, false).verifyAndDecodeAppReceipt(encode(receipt));
+        Assertions.assertEquals(receiptType, decoded.getReceiptType());
+
+        AppReceiptVerifier otherVerifier = getReceiptVerifier(receiptCreator, otherEnvironment, BUNDLE_ID, false);
+        VerificationException exception = Assertions.assertThrows(VerificationException.class, () -> otherVerifier.verifyAndDecodeAppReceipt(encode(receipt)));
+        Assertions.assertEquals(VerificationStatus.INVALID_ENVIRONMENT, exception.getStatus());
+    }
+
+    private static byte[] receiptWithQuantity(BigInteger quantity) throws Exception {
+        return ReceiptCreator.attributeSet()
+                .string(0, "ProductionSandbox")
+                .string(2, BUNDLE_ID)
+                .date(12, RECEIPT_CREATION_DATE)
+                .raw(17, ReceiptCreator.attributeSet()
+                        .raw(1701, new ASN1Integer(quantity).getEncoded())
+                        .string(1702, CONSUMABLE_PRODUCT_ID)
+                        .build())
                 .build();
     }
 
